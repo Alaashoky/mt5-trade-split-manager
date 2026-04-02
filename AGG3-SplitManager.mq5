@@ -48,7 +48,7 @@ input bool UseMeanReversion = true;   // Enable Mean Reversion strategy
 input int    SessionStart    = 0;     // Session start hour (0 = midnight)
 input int    SessionEnd      = 24;    // Session end hour (24 = all day)
 input int    MaxTradesPerDay = 8;     // Max logical trades per day
-input int    MaxOpenPositions = 10;   // Max open position groups (default 10 for splits)
+input int    MaxOpenPositions = 1;    // Max open position groups (1 = original AGG3 behavior)
 input double MaxSpreadPoints  = 35;   // Max spread in points before blocking entry
 
 // Kill switches
@@ -556,10 +556,18 @@ void ManagePositionMoneyStops(double atr_now)
         double bid       = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
         double ask       = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
 
+        // Scale money thresholds proportionally to position volume vs base Lots
+        double volRatio = (Lots > 0) ? vol / Lots : 1.0;
+        double effBE_Trigger     = BreakEven_Trigger_Money  * volRatio;
+        double effBE_Lock        = BreakEven_Lock_Money     * volRatio;
+        double effTrail_Trigger  = Trail_Trigger_Money      * volRatio;
+        double effTrail_Distance = Trail_Distance_Money     * volRatio;
+        double effTrail_Step     = Trail_Step_Money         * volRatio;
+
         // ── Break-even ──
-        if(UseBreakEvenMoney && curProfit >= BreakEven_Trigger_Money)
+        if(UseBreakEvenMoney && curProfit >= effBE_Trigger)
         {
-            double lockDist = MoneyToPriceDistance(MathMax(0.0, BreakEven_Lock_Money), vol);
+            double lockDist = MoneyToPriceDistance(MathMax(0.0, effBE_Lock), vol);
             if(type == POSITION_TYPE_BUY)
             {
                 double beSL = open + lockDist;
@@ -584,11 +592,11 @@ void ManagePositionMoneyStops(double atr_now)
         sl = PositionGetDouble(POSITION_SL);
 
         // ── Money trailing stop ──
-        if(UseTrailingMoney && curProfit >= Trail_Trigger_Money)
+        if(UseTrailingMoney && curProfit >= effTrail_Trigger)
         {
-            double lockMoney = MathMax(0.0, curProfit - Trail_Distance_Money);
+            double lockMoney = MathMax(0.0, curProfit - effTrail_Distance);
             double lockDist  = MoneyToPriceDistance(lockMoney, vol);
-            double stepDist  = MoneyToPriceDistance(MathMax(0.0, Trail_Step_Money), vol);
+            double stepDist  = MoneyToPriceDistance(MathMax(0.0, effTrail_Step), vol);
 
             if(type == POSITION_TYPE_BUY)
             {
@@ -1276,19 +1284,19 @@ void OnTick()
     int sigROC    = SigROC   (closes, barsLoaded);
     int sigCandle = SigCandle(opens, highs, lows, closes);
 
-    // Composite directional scores (0 – 10 scale, 4 signals × 2.5)
-    double buySigs  = ((sigTrend  ==  1) ? 1 : 0)
-                    + ((sigDon    ==  1) ? 1 : 0)
-                    + ((sigROC    ==  1) ? 1 : 0)
-                    + ((sigCandle ==  1) ? 1 : 0);
-    double sellSigs = ((sigTrend  == -1) ? 1 : 0)
-                    + ((sigDon    == -1) ? 1 : 0)
-                    + ((sigROC    == -1) ? 1 : 0)
-                    + ((sigCandle == -1) ? 1 : 0);
+    // Composite directional scores (0 – 100 scale, original AGG3 weighted scoring)
+    double buyScore = 0, sellScore = 0;
+    if(sigTrend  ==  1) buyScore  += 20; else if(sigTrend  == -1) sellScore += 20;
+    if(sigDon    ==  1) buyScore  += 25; else if(sigDon    == -1) sellScore += 25;
+    if(sigROC    ==  1) buyScore  += 15; else if(sigROC    == -1) sellScore += 15;
+    if(sigCandle ==  1) buyScore  += 15; else if(sigCandle == -1) sellScore += 15;
+    if(adx1 >= 15) { buyScore += 10; sellScore += 10; }
+    if(rsi1 <= 40) buyScore  += 15;
+    if(rsi1 >= 60) sellScore += 15;
+    buyScore  = Clamp(buyScore,  0, 100);
+    sellScore = Clamp(sellScore, 0, 100);
 
-    double buy_pct  = buySigs  * 2.5;
-    double sell_pct = sellSigs * 2.5;
-    double ml       = Clamp(rsi1 / 100.0, 0.0, 1.0); // Simple ML proxy: RSI normalised
+    double ml = buyScore / 100.0;  // ML proxy from composite score (original AGG3 logic)
 
     // Update regime
     UpdateRegime(adx1, atrArr[1], atrMA20);
@@ -1297,7 +1305,7 @@ void OnTick()
     StrategyType stratUsed = STRAT_NONE;
     EntryType    entry     = DecideEntry(sigTrend, adx1, rsi1, dist,
                                          sigDon, sigROC, bbPos, sigCandle,
-                                         buy_pct, sell_pct, ml, stratUsed);
+                                         buyScore, sellScore, ml, stratUsed);
 
     // Dashboard update (on new bar with fresh data)
     if(ShowDashboard && !(DisableDashboardInTester && (bool)MQLInfoInteger(MQL_TESTER)))
