@@ -55,6 +55,13 @@ input double MaxSpreadPoints  = 35;   // Max spread in points before blocking en
 input double MaxDailyLossMoney          = 25.0;  // Max daily loss in account currency
 input int    MaxConsecutiveLossesPerDay = 2;      // Max consecutive losing trades per day
 
+// ── Prop Firm Controls ──
+input bool   UseDailyDrawdownLimit   = true;   // Enable daily drawdown protection
+input double MaxDailyDrawdownPercent = 5.0;    // Max daily drawdown % (based on Balance)
+input bool   UseDailyProfitTarget    = false;  // Enable daily profit target
+input double DailyProfitTargetMoney  = 100.0;  // Daily profit target in account currency
+input bool   CloseAllOnDailyLimit    = true;   // Close all positions when DD/Profit triggers
+
 // Indicator parameters
 input int    ATR_Period     = 14;   // ATR period
 input int    ADX_Period     = 14;   // ADX period
@@ -182,6 +189,13 @@ string gTradeMgmtState = "IDLE";
 // Bar-timing guard (signal generation runs once per bar)
 datetime gLastBarTime = 0;
 
+// ── Daily limit tracking (Prop Firm controls) ──
+int    gDailyDate           = 0;
+double gDailyStartBalance   = 0.0;
+double gDailyPeakBalance    = 0.0;
+bool   gDailyLimitTriggered = false;
+string gDailyLimitReason    = "";
+
 //===========================================================================
 // SECTION 5 — General utility functions
 //===========================================================================
@@ -306,14 +320,110 @@ int ConsecutiveLossesToday()
     return losses;
 }
 
+// ── Prop Firm: close all open positions for InpSymbol ──
+void CloseAllSymbolPositions()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(PositionGetSymbol(i) != InpSymbol) continue;
+        ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+        if(!trade.PositionClose(ticket))
+            Print("CloseAllSymbolPositions: failed to close ticket #", ticket,
+                  " — ", trade.ResultRetcodeDescription());
+        else
+            Print("CloseAllSymbolPositions: closed ticket #", ticket);
+    }
+}
+
+// ── Prop Firm: delete all pending orders for InpSymbol ──
+void DeleteAllSymbolPendingOrders()
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket == 0) continue;
+        if(OrderGetString(ORDER_SYMBOL) != InpSymbol) continue;
+        if(!trade.OrderDelete(ticket))
+            Print("DeleteAllSymbolPendingOrders: failed to delete ticket #", ticket,
+                  " — ", trade.ResultRetcodeDescription());
+        else
+            Print("DeleteAllSymbolPendingOrders: deleted pending order #", ticket);
+    }
+}
+
+// ── Prop Firm: update daily tracking and enforce DD / profit limits ──
+void UpdateDailyLimits()
+{
+    MqlDateTime d;
+    TimeToStruct(TimeCurrent(), d);
+    int    today          = d.year * 10000 + d.mon * 100 + d.day;
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+    // Reset on new trading day
+    if(gDailyDate != today)
+    {
+        gDailyDate           = today;
+        gDailyStartBalance   = currentBalance;
+        gDailyPeakBalance    = currentBalance;
+        gDailyLimitTriggered = false;
+        gDailyLimitReason    = "";
+        Print("Daily reset — Date:", today, " StartBalance:", DoubleToString(currentBalance, 2));
+    }
+
+    // Update peak balance
+    if(currentBalance > gDailyPeakBalance)
+        gDailyPeakBalance = currentBalance;
+
+    // Nothing more to evaluate if limit already active
+    if(gDailyLimitTriggered) return;
+
+    // Check daily drawdown
+    if(UseDailyDrawdownLimit && gDailyPeakBalance > 0)
+    {
+        double ddPct = (gDailyPeakBalance - currentBalance) / gDailyPeakBalance * 100.0;
+        if(ddPct >= MaxDailyDrawdownPercent)
+        {
+            gDailyLimitTriggered = true;
+            gDailyLimitReason    = StringFormat("DAILY_DD_%.2fPCT", MaxDailyDrawdownPercent);
+            Print("Daily drawdown limit triggered: ", DoubleToString(ddPct, 2),
+                  "% >= ", MaxDailyDrawdownPercent, "% — Reason: ", gDailyLimitReason);
+            if(CloseAllOnDailyLimit)
+            {
+                CloseAllSymbolPositions();
+                DeleteAllSymbolPendingOrders();
+            }
+            return;
+        }
+    }
+
+    // Check daily profit target
+    if(UseDailyProfitTarget)
+    {
+        double profit = currentBalance - gDailyStartBalance;
+        if(profit >= DailyProfitTargetMoney)
+        {
+            gDailyLimitTriggered = true;
+            gDailyLimitReason    = StringFormat("DAILY_PROFIT_$%.2f", DailyProfitTargetMoney);
+            Print("Daily profit target reached: $", DoubleToString(profit, 2),
+                  " >= $", DailyProfitTargetMoney, " — Reason: ", gDailyLimitReason);
+            if(CloseAllOnDailyLimit)
+            {
+                CloseAllSymbolPositions();
+                DeleteAllSymbolPendingOrders();
+            }
+        }
+    }
+}
+
 bool CommonFiltersPass()
 {
-    if(!InSession(HourNow()))                                     return false;
-    if(SpreadPoints() > MaxSpreadPoints)                          return false;
-    if(CountOpenGroupsBySymbol() >= MaxOpenPositions)             return false;
-    if(CountTodayEntries() >= MaxTradesPerDay)                    return false;
-    if(DailyClosedPnl() <= -MathAbs(MaxDailyLossMoney))          return false;
-    if(ConsecutiveLossesToday() >= MaxConsecutiveLossesPerDay)    return false;
+    if(gDailyLimitTriggered)                                          return false;
+    if(!InSession(HourNow()))                                         return false;
+    if(SpreadPoints() > MaxSpreadPoints)                              return false;
+    if(CountOpenGroupsBySymbol() >= MaxOpenPositions)                 return false;
+    if(CountTodayEntries() >= MaxTradesPerDay)                        return false;
+    if(DailyClosedPnl() <= -MathAbs(MaxDailyLossMoney))              return false;
+    if(ConsecutiveLossesToday() >= MaxConsecutiveLossesPerDay)        return false;
     return true;
 }
 
@@ -1115,7 +1225,20 @@ void RenderDash(double adxNow, double atrNow, double rsiNow,
                xp, row, ksClr, 9);
     row += lh;
 
-    // ── NEW: Split order status line ──
+    // ── Prop Firm daily limit status ──
+    color pfClr = gDailyLimitTriggered ? C_Red : C_Gray;
+    double ddPctNow = (gDailyPeakBalance > 0)
+                      ? (gDailyPeakBalance - AccountInfoDouble(ACCOUNT_BALANCE)) / gDailyPeakBalance * 100.0
+                      : 0.0;
+    string pfText = gDailyLimitTriggered
+                    ? "PROP: BLOCKED — " + gDailyLimitReason
+                    : StringFormat("PROP: DD=%.2f%%  DayProfit=$%.2f",
+                                   ddPctNow,
+                                   AccountInfoDouble(ACCOUNT_BALANCE) - gDailyStartBalance);
+    UIDrawText("DASH_PROP", pfText, xp, row, pfClr, 9);
+    row += lh;
+
+    // ── Split order status line ──
     if(UseSplitOrders)
     {
         int tp2Active = 0;
@@ -1163,6 +1286,15 @@ int OnInit()
     // Recover any existing split groups from open positions
     if(UseSplitOrders) RecoverSplitOrders();
 
+    // Initialize daily limit tracking
+    MqlDateTime d;
+    TimeToStruct(TimeCurrent(), d);
+    gDailyDate           = d.year * 10000 + d.mon * 100 + d.day;
+    gDailyStartBalance   = AccountInfoDouble(ACCOUNT_BALANCE);
+    gDailyPeakBalance    = gDailyStartBalance;
+    gDailyLimitTriggered = false;
+    gDailyLimitReason    = "";
+
     Print("AGG3-SplitManager initialized. UseSplitOrders=", UseSplitOrders);
     return INIT_SUCCEEDED;
 }
@@ -1190,6 +1322,9 @@ void OnDeinit(const int reason)
 //--------------------------------------------------------------------------
 void OnTick()
 {
+    // ── Per-tick: enforce Prop Firm daily limits (DD + profit target) ──
+    UpdateDailyLimits();
+
     // ── Per-tick: load ATR for money management ──
     double atr[];
     ArraySetAsSeries(atr, true);
